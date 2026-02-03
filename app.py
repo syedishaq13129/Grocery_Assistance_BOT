@@ -1,229 +1,358 @@
-from flask import Flask, request, jsonify, render_template_string
-import boto3
+from flask import Flask, request, jsonify
 import json
-import os
+import boto3
 from decimal import Decimal
 
 app = Flask(__name__)
 
-# AWS clients
+bedrock_runtime = boto3.client('bedrock-runtime', region_name='ap-south-1')
 dynamodb = boto3.resource('dynamodb', region_name='ap-south-1')
-bedrock = boto3.client('bedrock-runtime', region_name='ap-south-1')
 
-class DecimalEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, Decimal):
-            return float(obj)
-        return super(DecimalEncoder, self).default(obj)
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError
 
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
+def get_inventory_data():
+    try:
+        table = dynamodb.Table('GroceryInventory')
+        response = table.scan()
+        return response['Items']
+    except Exception as e:
+        return []
+
+def get_recipes_data():
+    try:
+        table = dynamodb.Table('GroceryRecipes')
+        response = table.scan()
+        return response['Items']
+    except Exception as e:
+        return []
+
+def generate_chat_response(user_message, inventory, recipes):
+    try:
+        context = f"""You are a helpful grocery inventory assistant. 
+
+Current Inventory:
+{json.dumps(inventory, indent=2, default=decimal_default)}
+
+Available Recipes:
+{json.dumps(recipes, indent=2, default=decimal_default)}
+
+Answer questions about inventory levels, product availability, and recipe suggestions based on available ingredients."""
+
+        request_body = {
+            "messages": [{"role": "user", "content": f"{context}\n\nUser Question: {user_message}"}],
+            "max_tokens": 1000,
+            "anthropic_version": "bedrock-2023-05-31"
+        }
+        
+        response = bedrock_runtime.invoke_model(
+            modelId='anthropic.claude-3-5-sonnet-20241022-v2:0',
+            body=json.dumps(request_body)
+        )
+        
+        response_body = json.loads(response['body'].read())
+        return response_body['content'][0]['text']
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@app.route('/')
+def home():
+    return '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Grocery Assistant Bot</title>
+    <title>Grocery Inventory Assistant</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             display: flex;
-            align-items: center;
             justify-content: center;
+            align-items: center;
+            padding: 20px;
         }
-        .chat-container {
-            width: 90%;
-            max-width: 800px;
-            height: 80vh;
-            background: rgba(255, 255, 255, 0.95);
+        
+        .container {
+            background: white;
             border-radius: 20px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 800px;
+            width: 100%;
+            height: 600px;
             display: flex;
             flex-direction: column;
             overflow: hidden;
         }
-        .chat-header {
+        
+        .header {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            padding: 20px;
+            padding: 25px;
             text-align: center;
-            font-size: 24px;
-            font-weight: bold;
         }
-        .chat-messages {
+        
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 5px;
+        }
+        
+        .header p {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+        
+        .chat-container {
             flex: 1;
-            padding: 20px;
             overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
+            padding: 20px;
+            background: #f8f9fa;
         }
+        
         .message {
-            max-width: 80%;
-            padding: 15px 20px;
-            border-radius: 20px;
-            opacity: 0;
-            animation: fadeIn 0.3s ease-in forwards;
+            margin-bottom: 15px;
+            display: flex;
+            animation: fadeIn 0.3s ease-in;
         }
-        .user-message {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .message.user {
+            justify-content: flex-end;
+        }
+        
+        .message-content {
+            max-width: 70%;
+            padding: 12px 18px;
+            border-radius: 18px;
+            word-wrap: break-word;
+        }
+        
+        .message.user .message-content {
+            background: #667eea;
             color: white;
-            align-self: flex-end;
-            border-bottom-right-radius: 5px;
+            border-bottom-right-radius: 4px;
         }
-        .bot-message {
-            background: #f1f3f4;
+        
+        .message.assistant .message-content {
+            background: white;
             color: #333;
-            align-self: flex-start;
-            border-bottom-left-radius: 5px;
+            border: 1px solid #e0e0e0;
+            border-bottom-left-radius: 4px;
         }
-        .chat-input {
+        
+        .input-container {
             padding: 20px;
             background: white;
-            border-top: 1px solid #eee;
+            border-top: 1px solid #e0e0e0;
             display: flex;
             gap: 10px;
         }
-        .chat-input input {
+        
+        #user-input {
             flex: 1;
-            padding: 15px 20px;
-            border: 2px solid #ddd;
+            padding: 12px 18px;
+            border: 2px solid #e0e0e0;
             border-radius: 25px;
-            font-size: 16px;
+            font-size: 15px;
             outline: none;
             transition: border-color 0.3s;
         }
-        .chat-input input:focus {
+        
+        #user-input:focus {
             border-color: #667eea;
         }
-        .chat-input button {
-            padding: 15px 30px;
+        
+        #send-btn {
+            padding: 12px 30px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             border: none;
             border-radius: 25px;
             cursor: pointer;
-            font-size: 16px;
-            font-weight: bold;
-            transition: transform 0.2s;
+            font-size: 15px;
+            font-weight: 600;
+            transition: transform 0.2s, box-shadow 0.2s;
         }
-        .chat-input button:hover {
+        
+        #send-btn:hover {
             transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
         }
+        
+        #send-btn:active {
+            transform: translateY(0);
+        }
+        
+        #send-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
         .loading {
-            display: flex;
-            gap: 5px;
-            padding: 15px 20px;
-        }
-        .loading-dot {
+            display: inline-block;
             width: 8px;
             height: 8px;
-            background: #667eea;
             border-radius: 50%;
-            animation: pulse 1.4s ease-in-out infinite both;
+            background: #667eea;
+            animation: pulse 1.4s infinite ease-in-out;
         }
-        .loading-dot:nth-child(1) { animation-delay: -0.32s; }
-        .loading-dot:nth-child(2) { animation-delay: -0.16s; }
-        @keyframes fadeIn {
-            to { opacity: 1; }
-        }
+        
         @keyframes pulse {
-            0%, 80%, 100% { transform: scale(0); }
-            40% { transform: scale(1); }
+            0%, 80%, 100% { opacity: 0.3; }
+            40% { opacity: 1; }
+        }
+        
+        .welcome-message {
+            text-align: center;
+            color: #666;
+            padding: 40px 20px;
+        }
+        
+        .welcome-message h2 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: #764ba2;
         }
     </style>
 </head>
 <body>
-    <div class="chat-container">
-        <div class="chat-header">
-            🛒 Grocery Assistant Bot
+    <div class="container">
+        <div class="header">
+            <h1>🛒 Grocery Inventory Assistant</h1>
+            <p>Ask me about inventory, recipes, or product availability</p>
         </div>
-        <div class="chat-messages" id="messages">
-            <div class="message bot-message">
-                Hello! I'm your Grocery Assistant. I can help you with inventory management and recipe suggestions. Try asking me:
-                <br><br>
-                • "What's in my inventory?"<br>
-                • "Show me available recipes"<br>
-                • "What can I cook with chicken?"
+        
+        <div class="chat-container" id="chat-container">
+            <div class="welcome-message">
+                <h2>Welcome!</h2>
+                <p>Ask me anything about our grocery inventory or recipes.</p>
+                <p style="margin-top: 10px; font-size: 13px;">Try: "What items are low in stock?" or "Show me recipes with chicken"</p>
             </div>
         </div>
-        <div class="chat-input">
-            <input type="text" id="messageInput" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
-            <button onclick="sendMessage()">Send</button>
+        
+        <div class="input-container">
+            <input type="text" id="user-input" placeholder="Type your message here..." />
+            <button id="send-btn">Send</button>
         </div>
     </div>
 
     <script>
-        function handleKeyPress(event) {
-            if (event.key === 'Enter') {
-                sendMessage();
+        const chatContainer = document.getElementById('chat-container');
+        const userInput = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        
+        function addMessage(content, isUser) {
+            const welcomeMsg = chatContainer.querySelector('.welcome-message');
+            if (welcomeMsg) {
+                welcomeMsg.remove();
+            }
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${isUser ? 'user' : 'assistant'}`;
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.textContent = content;
+            
+            messageDiv.appendChild(contentDiv);
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        function addLoadingMessage() {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            messageDiv.id = 'loading-message';
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.innerHTML = '<span class="loading"></span> <span class="loading"></span> <span class="loading"></span>';
+            
+            messageDiv.appendChild(contentDiv);
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        function removeLoadingMessage() {
+            const loadingMsg = document.getElementById('loading-message');
+            if (loadingMsg) {
+                loadingMsg.remove();
             }
         }
-
-        function sendMessage() {
-            const input = document.getElementById('messageInput');
-            const message = input.value.trim();
-            
+        
+        async function sendMessage() {
+            const message = userInput.value.trim();
             if (!message) return;
             
-            addMessage(message, 'user');
-            input.value = '';
+            addMessage(message, true);
+            userInput.value = '';
+            sendBtn.disabled = true;
             
-            showLoading();
+            addLoadingMessage();
             
-            fetch('/chat', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ message: message })
-            })
-            .then(response => response.json())
-            .then(data => {
-                hideLoading();
-                addMessage(data.response, 'bot');
-            })
-            .catch(error => {
-                hideLoading();
-                addMessage('Sorry, something went wrong. Please try again.', 'bot');
-            });
-        }
-
-        function addMessage(text, sender) {
-            const messagesContainer = document.getElementById('messages');
-            const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${sender}-message`;
-            messageDiv.textContent = text;
-            messagesContainer.appendChild(messageDiv);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }
-
-        function showLoading() {
-            const messagesContainer = document.getElementById('messages');
-            const loadingDiv = document.createElement('div');
-            loadingDiv.className = 'message bot-message loading';
-            loadingDiv.id = 'loading';
-            loadingDiv.innerHTML = '<div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div>';
-            messagesContainer.appendChild(loadingDiv);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }
-
-        function hideLoading() {
-            const loading = document.getElementById('loading');
-            if (loading) {
-                loading.remove();
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ message: message })
+                });
+                
+                const data = await response.json();
+                removeLoadingMessage();
+                addMessage(data.response, false);
+            } catch (error) {
+                removeLoadingMessage();
+                addMessage('Sorry, there was an error processing your request.', false);
+                console.error('Error:', error);
             }
+            
+            sendBtn.disabled = false;
+            userInput.focus();
         }
+        
+        sendBtn.addEventListener('click', sendMessage);
+        userInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        userInput.focus();
     </script>
 </body>
-</html>
-'''
-
-@app.route('/')
-def home():
-    return render_template_string(HTML_TEMPLATE)
+</html>'''
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -231,63 +360,14 @@ def chat():
         data = request.get_json()
         user_message = data.get('message', '')
         
-        if not user_message:
-            return jsonify({'error': 'Message is required'}), 400
+        inventory = get_inventory_data()
+        recipes = get_recipes_data()
+        response = generate_chat_response(user_message, inventory, recipes)
         
-        # Get inventory data
-        inventory_table = dynamodb.Table('GroceryInventory')
-        inventory_response = inventory_table.scan()
-        inventory_items = inventory_response.get('Items', [])
-        
-        # Get recipes data
-        recipes_table = dynamodb.Table('GroceryRecipes')
-        recipes_response = recipes_table.scan()
-        recipes_items = recipes_response.get('Items', [])
-        
-        # Prepare context for AI
-        inventory_text = json.dumps(inventory_items, cls=DecimalEncoder, indent=2)
-        recipes_text = json.dumps(recipes_items, cls=DecimalEncoder, indent=2)
-        
-        prompt = f"""You are a helpful grocery inventory assistant. You have access to the user's current inventory and available recipes.
-
-Current Inventory:
-{inventory_text}
-
-Available Recipes:
-{recipes_text}
-
-User Question: {user_message}
-
-Please provide a helpful response based on the inventory and recipes available. Be conversational and practical."""
-        
-        # Call Bedrock
-        bedrock_body = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": 1000,
-            "anthropic_version": "bedrock-2023-05-31"
-        }
-        
-        response = bedrock.invoke_model(
-            modelId='anthropic.claude-3-5-sonnet-20241022-v2:0',
-            body=json.dumps(bedrock_body)
-        )
-        
-        response_body = json.loads(response['body'].read())
-        ai_response = response_body['content'][0]['text']
-        
-        return jsonify({'response': ai_response})
+        return jsonify({'response': response})
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/health')
-def health():
-    return jsonify({'status': 'healthy'})
-
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
+    app.run(host='0.0.0.0', port=8000)
